@@ -1,4 +1,3 @@
-\echo Use "CREATE EXTENSION sheduler_ex" to load this file. \quit
 CREATE SCHEMA sheduler_ex;
 
 -- Таблица для хранения задач
