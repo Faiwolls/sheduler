@@ -1,0 +1,6 @@
+#sheduler_ex extension
+comment = 'Background task scheduler'
+default_version = '1.0'
+module_pathname = '$libdir/sheduler_ex'
+relocatable = false
+trusted = false
