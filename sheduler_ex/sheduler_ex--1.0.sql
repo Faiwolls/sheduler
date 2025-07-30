@@ -1,5 +1,8 @@
 \echo Use "CREATE EXTENSION sheduler_ex" to load this file. \quit
-CREATE SCHEMA sheduler_ex;
+
+-- Создаем схему только если она не существует
+CREATE SCHEMA IF NOT EXISTS sheduler_ex;
+COMMENT ON SCHEMA sheduler_ex IS 'Scheduler extension schema';
 
 -- Таблица для хранения задач
 CREATE TABLE sheduler_ex.tasks (
@@ -7,139 +10,77 @@ CREATE TABLE sheduler_ex.tasks (
     name TEXT NOT NULL,
     scheduled_time TIMESTAMPTZ NOT NULL,
     command TEXT NOT NULL,
+    task_type TEXT NOT NULL DEFAULT 'SQL' CHECK (task_type IN ('SQL', 'SHELL')),
     status TEXT NOT NULL DEFAULT 'pending' 
-        CHECK (status IN ('pending', 'running', 'completed', 'failed', 'canceled')),
+        CHECK (status IN ('pending', 'running', 'completed', 'failed')),
+    priority INTEGER NOT NULL DEFAULT 5,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     started_at TIMESTAMPTZ,
     completed_at TIMESTAMPTZ,
-    attempts SMALLINT DEFAULT 0,
-    max_attempts SMALLINT DEFAULT 3,
-    worker_id INT
+    worker_pid INTEGER
 );
 
 -- Индексы для оптимизации
-CREATE INDEX tasks_pending_idx ON sheduler_ex.tasks (scheduled_time)
+CREATE INDEX tasks_pending_idx ON sheduler_ex.tasks (scheduled_time, priority)
 WHERE status = 'pending';
 
 CREATE INDEX tasks_running_idx ON sheduler_ex.tasks (started_at)
 WHERE status = 'running';
 
--- Конфигурация планировщика
-CREATE TABLE sheduler_ex.config (
-    key TEXT PRIMARY KEY,
-    value TEXT NOT NULL,
-    description TEXT
-);
-
-INSERT INTO sheduler_ex.config (key, value, description) VALUES
-('max_attempts', '3', 'Maximum task execution attempts'),
-('retry_delay', '5 minutes', 'Delay between task retries'),
-('lock_timeout', '10 seconds', 'Max task execution time');
-
 -- Функция для добавления задачи
-CREATE OR REPLACE FUNCTION sheduler_ex.add_task(
+CREATE FUNCTION sheduler_ex.add_task(
     task_name TEXT,
     task_time TIMESTAMPTZ,
     task_command TEXT,
-    max_attempts INT DEFAULT NULL
+    task_type TEXT DEFAULT 'SQL',
+    task_priority INTEGER DEFAULT 5
 ) RETURNS BIGINT AS $$
-INSERT INTO sheduler_ex.tasks (name, scheduled_time, command, max_attempts)
-VALUES (
-    task_name,
-    task_time,
-    task_command,
-    COALESCE(max_attempts, (SELECT value::INT FROM sheduler_ex.config WHERE key = 'max_attempts'))
+INSERT INTO sheduler_ex.tasks (name, scheduled_time, command, task_type, priority)
+VALUES (task_name, task_time, task_command, task_type, task_priority)
 RETURNING id;
 $$ LANGUAGE SQL VOLATILE;
 
--- Функция для запуска воркера
-CREATE OR REPLACE FUNCTION sheduler_ex.launch_worker()
-RETURNS VOID AS $$
+-- Функция отмены задачи
+CREATE FUNCTION sheduler_ex.cancel_task(task_id BIGINT)
+RETURNS BOOLEAN AS $$
 DECLARE
-    task_record RECORD;
-    lock_timeout INTERVAL;
+    worker_pid INT;
 BEGIN
-    -- Получаем настройки
-    SELECT value::INTERVAL INTO lock_timeout 
-    FROM sheduler_ex.config 
-    WHERE key = 'lock_timeout';
+    SELECT worker_pid INTO worker_pid 
+    FROM sheduler_ex.tasks 
+    WHERE id = task_id 
+    AND status = 'running';
 
-    -- Блокируем задачу для обработки
-    SELECT * INTO task_record
-    FROM sheduler_ex.tasks
-    WHERE status = 'pending'
-      AND scheduled_time <= NOW()
-      AND (attempts < max_attempts OR status != 'failed')
-    ORDER BY scheduled_time
-    FOR UPDATE SKIP LOCKED
-    LIMIT 1;
-
-    IF NOT FOUND THEN
-        RETURN;
+    IF FOUND THEN
+        PERFORM pg_cancel_backend(worker_pid);
     END IF;
 
-    -- Устанавливаем таймаут выполнения
-    EXECUTE format('SET LOCAL lock_timeout = %L', lock_timeout);
-
-    -- Обновляем статус задачи
     UPDATE sheduler_ex.tasks
-    SET status = 'running',
-        started_at = NOW(),
-        attempts = attempts + 1,
-        worker_id = pg_backend_pid()
-    WHERE id = task_record.id
-    RETURNING * INTO task_record;
-
-    -- Выполняем команду
-    BEGIN
-        EXECUTE task_record.command;
-        
-        UPDATE sheduler_ex.tasks
-        SET status = 'completed',
-            completed_at = NOW()
-        WHERE id = task_record.id;
-    EXCEPTION WHEN OTHERS THEN
-        -- Обработка ошибок с повторными попытками
-        UPDATE sheduler_ex.tasks
-        SET status = CASE 
-                     WHEN attempts < max_attempts THEN 'pending' 
-                     ELSE 'failed' 
-                     END,
-            scheduled_time = CASE 
-                            WHEN attempts < max_attempts THEN 
-                                NOW() + (SELECT value::INTERVAL 
-                                         FROM sheduler_ex.config 
-                                         WHERE key = 'retry_delay')
-                            ELSE scheduled_time
-                            END
-        WHERE id = task_record.id;
-        
-        RAISE WARNING 'Task % failed: %', task_record.id, SQLERRM;
-    END;
-END;
-$$ LANGUAGE plpgsql;
-
--- Функция управления задачами
-CREATE OR REPLACE FUNCTION sheduler_ex.cancel_task(task_id BIGINT)
-RETURNS BOOLEAN AS $$
-BEGIN
-    UPDATE sheduler_ex.tasks
-    SET status = 'canceled'
+    SET status = 'failed'
     WHERE id = task_id
     AND status IN ('pending', 'running');
     
-    IF NOT FOUND THEN
-        RETURN false;
-    END IF;
-    RETURN true;
+    RETURN FOUND;
 END;
 $$ LANGUAGE plpgsql;
 
+-- Мониторинг задач
+CREATE VIEW sheduler_ex.active_tasks AS
+SELECT 
+    id, 
+    name, 
+    status, 
+    EXTRACT(EPOCH FROM (NOW() - started_at)) AS duration_sec
+FROM sheduler_ex.tasks
+WHERE status IN ('running', 'pending');
+
 -- Мониторинг воркеров
 CREATE VIEW sheduler_ex.worker_status AS
-SELECT pid AS worker_pid,
-       now() - state_change AS last_activity,
-       state
+SELECT 
+    pid, 
+    application_name, 
+    state,
+    now() - state_change AS state_duration
 FROM pg_stat_activity
 WHERE backend_type = 'background worker'
-AND application_name LIKE 'Scheduler Worker%';
+AND application_name LIKE 'Task Worker%';
